@@ -1,0 +1,8 @@
+CXX ?= g++
+CXXFLAGS ?= -O2 -Wall -Wextra -Wpedantic
+
+.PHONY: all
+all: EmulTowerPRRTest.exe
+
+EmulTowerPRRTest.exe: stage1-PRR/EmulTowerPRRTest.cpp TPGStage1Emulation/TowerSums.cpp TPGStage1Emulation/TowerSums.h TPGStage1Emulation/Utilities.cpp TPGStage1Emulation/Utilities.h
+	$(CXX) $(CXXFLAGS) -std=c++17 -ITPGStage1Emulation stage1-PRR/EmulTowerPRRTest.cpp TPGStage1Emulation/TowerSums.cpp TPGStage1Emulation/Utilities.cpp -o $@

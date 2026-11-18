@@ -27,13 +27,15 @@ pair<int, int> TowerSums::getParametersFromVhFile( const string& inputFileName )
    
    if (!inputFile.is_open())
    {
-      cerr << "Error opening file!" << endl;
+      throw runtime_error("Cannot open mapping: " + inputFileName);
    }
    
    string line;
    
    int numInputs = 0;
    int numOutputs = 0;
+   bool foundInputs = false;
+   bool foundOutputs = false;
    
    regex inputRegex(R"(/\* num inputs = (\d+).*\*/)");
    regex outputRegex(R"(/\* num outputs = (\d+).*\*/)");
@@ -44,14 +46,16 @@ pair<int, int> TowerSums::getParametersFromVhFile( const string& inputFileName )
       if (regex_search(line, match, inputRegex))
       {
          numInputs = stoi(match[1]);
+         foundInputs = true;
       }
       else if (std::regex_search(line, match, outputRegex))
       {
          numOutputs = stoi(match[1]);
+         foundOutputs = true;
       }
       
       // Break if both values are found
-      if (numInputs != 0 && numOutputs != 0)
+      if (foundInputs && foundOutputs)
       {
          break;
       }
@@ -59,16 +63,9 @@ pair<int, int> TowerSums::getParametersFromVhFile( const string& inputFileName )
 
    inputFile.close();
 
-   if (numInputs != 0 && numOutputs != 0)
+   if (!foundInputs || !foundOutputs)
    {
-      cout << "Number of inputs and outputs successfully extracted!" << endl;
-      
-//      cout << "Number of inputs: " << numInputs << endl;
-//      cout << "Number of outputs: " << numOutputs << endl;
-   }
-   else
-   {
-      cerr << "Failed to extract required values!" << endl;
+      throw runtime_error("Missing input/output dimensions in mapping: " + inputFileName);
    }
 
    return {numInputs, numOutputs};
@@ -128,7 +125,8 @@ vector<vector<int>> TowerSums::vhArchInputToArray_CE_E( const string& inputFileN
                tempString_variable.push_back(token);  
             }
                                    
-            tempString_variable.pop_back();
+            // getline does not retain an empty field after a trailing comma.
+            // The final token is a real mapping weight and must be kept.
                                    
             if (tempString_variable.size() > 1)
             {
@@ -214,7 +212,7 @@ vector<vector<vector<int>>> TowerSums::vhArchInputToArray_CE_H( const string& in
                tempString_variable.push_back(token);  
             }
                                    
-            tempString_variable.pop_back();
+            // Keep the final mapping weight (also for files with LF endings).
             
 
             if (tempString_variable.size() > 1)
@@ -878,7 +876,7 @@ vector<uint64_t> TowerSums::summation( const vector<uint64_t>& inputData, const 
             }
          } // End for loop
          
-         output.push_back(sumTemp >> 4);
+         output.push_back(sumTemp);
                
       } // End if loop
    } // End for loop
@@ -892,6 +890,8 @@ vector<uint64_t> TowerSums::summation( const vector<uint64_t>& inputData, const 
 //=============================================================================================
 vector<uint64_t> TowerSums::overflowChecker(const vector<uint64_t>& inputData, int overflowBit)
 {
+   if (overflowBit < 1 || overflowBit > 63)
+      throw invalid_argument("overflowBit must be between 1 and 63");
    vector<uint64_t> output;
    
 
@@ -902,7 +902,7 @@ vector<uint64_t> TowerSums::overflowChecker(const vector<uint64_t>& inputData, i
       if (inputData[i] >> overflowBit)
       {
          // Overflow occurred, saturate to max value at overflowBit number of bits
-         int maxValue = (1 << overflowBit) - 1;  // Equivalent to '111...111' (overflowBit number of bits)
+         const uint64_t maxValue = (uint64_t{1} << overflowBit) - 1;
          output.push_back(maxValue);
 
          // Debugging messages
@@ -925,14 +925,13 @@ vector<uint64_t> TowerSums::overflowChecker(const vector<uint64_t>& inputData, i
 vector<uint64_t> TowerSums::trimming(const vector<uint64_t>& inputData, int targetNumberBits, int MSB)
 {
 
-   assert(MSB >= targetNumberBits);  // Ensure MSB is greater than or equal to targetNumberBits
+   if (targetNumberBits < 1 || MSB < targetNumberBits || MSB > 63)
+      throw invalid_argument("trimming requires 1 <= targetNumberBits <= MSB <= 63");
 
    vector<uint64_t> output;
 
    // Constructing selection mask so to set all bits left of MSB to zero
-   unsigned long long maskInt = (1ULL << 34) - 1;
-   
-   cout << "maskInt = " << maskInt << endl;
+   const uint64_t maskInt = (uint64_t{1} << MSB) - 1;
    
    int criticalBitNumber = MSB - targetNumberBits;
 
@@ -953,6 +952,100 @@ vector<uint64_t> TowerSums::trimming(const vector<uint64_t>& inputData, int targ
 vector<uint64_t> TowerSums::packInteger4e4m(const vector<uint64_t>& inputData)
 {
    return utilities->pack4e4mFromInt(inputData);
+}
+
+vector<uint64_t> TowerSums::trimmingWithRounding(const vector<uint64_t>& inputData,
+                                               int targetNumberBits, int MSB)
+{
+   if (targetNumberBits < 1 || MSB < targetNumberBits || MSB > 63)
+      throw invalid_argument("rounding requires 1 <= targetNumberBits <= MSB <= 63");
+   const uint64_t maxInput = (uint64_t{1} << MSB) - 1;
+   const uint64_t maxOutput = (uint64_t{1} << targetNumberBits) - 1;
+   const int shift = MSB - targetNumberBits;
+   vector<uint64_t> output;
+   output.reserve(inputData.size());
+   for (uint64_t value : inputData) {
+      // Python CE-E saturates before rounding, then saturates the rounded result.
+      value = min(value, maxInput);
+      if (shift > 0)
+         value = (value + (uint64_t{1} << (shift - 1))) >> shift;
+      output.push_back(min(value, maxOutput));
+   }
+   return output;
+}
+
+vector<uint64_t> TowerSums::emulateCE_E(const vector<uint64_t>& packed,
+                                     const vector<vector<int>>& architecture,
+                                     int msb, int targetBits)
+{
+   if (targetBits < 1 || targetBits > 19)
+      throw invalid_argument("CE-E targetBits must be between 1 and 19");
+   for (uint64_t value : packed)
+      if (value >= 0x100)
+         throw invalid_argument("CE-E input must be packed 5E3M (8 bits)");
+   for (const auto& row : architecture) {
+      if (row.size() != packed.size())
+         throw invalid_argument("CE-E input count does not match the mapping");
+      for (int weight : row)
+         if (weight < 0 || weight > 16)
+            throw invalid_argument("Mapping weights must be between 0 and 16");
+   }
+   auto decoded = unpackInteger3m(packed);
+   auto trimmed = trimmingWithRounding(decoded, targetBits, msb);
+   auto sums = summation(trimmed, architecture, 2, false);
+   for (auto& sum : sums) {
+      sum = (sum + 8) >> 4;
+      if (sum >= 0x80000)
+         throw overflow_error("CE-E tower input to pack4E4M exceeds 19 bits");
+   }
+   return packInteger4e4m(sums);
+}
+
+vector<uint64_t> TowerSums::emulateCE_H(const vector<vector<uint64_t>>& packed,
+                                     const vector<vector<vector<int>>>& architecture,
+                                     int msb, int targetBits)
+{
+   constexpr size_t words = 6;
+   if (targetBits < 5 || targetBits > 19)
+      throw invalid_argument("CE-H targetBits must be between 5 and 19");
+   if (packed.size() != words)
+      throw invalid_argument("CE-H oneSize input requires six word rows");
+   const size_t inputs = packed[0].size();
+   for (const auto& word : packed) {
+      if (word.size() != inputs)
+         throw invalid_argument("CE-H input rows have inconsistent lengths");
+      for (uint64_t value : word)
+         if (value >= 0x200)
+            throw invalid_argument("CE-H input must be packed 5E4M (9 bits)");
+   }
+   for (const auto& row : architecture) {
+      if (row.size() != inputs)
+         throw invalid_argument("CE-H input count does not match the mapping");
+      for (const auto& channel : row) {
+         if (channel.size() != words)
+            throw invalid_argument("CE-H oneSize mapping requires six word indices");
+         for (int weight : channel)
+            if (weight < 0 || weight > 16)
+               throw invalid_argument("Mapping weights must be between 0 and 16");
+      }
+   }
+   auto decoded = unpackInteger4m(packed);
+   vector<uint64_t> sums(architecture.size(), 0);
+   for (size_t word = 0; word < words; ++word) {
+      auto trimmed = trimming(decoded[word], targetBits - 4, msb);
+      vector<vector<int>> slice(architecture.size(), vector<int>(inputs, 0));
+      for (size_t tower = 0; tower < architecture.size(); ++tower)
+         for (size_t input = 0; input < inputs; ++input)
+            slice[tower][input] = architecture[tower][input][word];
+      // Preserve all fractional bits across the six word sums.
+      sums = addVectors(sums, summation(trimmed, slice, 2, false));
+   }
+   for (auto& sum : sums) {
+      sum >>= 4;
+      if (sum >= 0x80000)
+         throw overflow_error("CE-H tower input to pack4E4M exceeds 19 bits");
+   }
+   return packInteger4e4m(sums);
 }
 //============================================================================
    
